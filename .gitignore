@@ -1,0 +1,50 @@
+# R project files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# R environment
+renv/library/
+renv/.cache/
+
+# Large data files (do not commit raw scRNA-seq data)
+data/*.mtx
+data/*.mtx.gz
+data/*.tsv
+data/*.tsv.gz
+data/*.csv
+data/*.h5
+data/*.h5ad
+data/*.loom
+
+# Seurat objects (large RDS files)
+*.rds
+*.RDS
+
+# CellChat objects
+cellchat*.rds
+
+# Output plots
+*.png
+*.pdf
+*.svg
+figures/
+
+# Temporary files
+*.tmp
+*.log
+Rplots.pdf
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Session info
+session_info.txt

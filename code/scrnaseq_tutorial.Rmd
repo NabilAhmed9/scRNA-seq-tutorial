@@ -1,0 +1,1527 @@
+---
+title: "Single-Cell RNA-seq Analysis: From Raw Counts to Cell Communication"
+author: "Based on materials by Farag Ibrahim, University of Gothenburg, Sweden"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    code_folding: show
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 6,
+  dpi = 150
+)
+```
+
+---
+
+# Before You Start
+
+## What this notebook teaches
+
+This notebook walks through a complete single-cell RNA-seq (scRNA-seq) analysis of mouse
+bone marrow immune cells at two time points: **Day 0** and **Day 14** (GEO: GSE142564).
+
+Every code chunk is paired with an explanation of **why** that step exists — not just how
+to run it. By the end, you will have performed:
+
+- Multi-metric quality control and cell filtering
+- SCTransform normalisation with cell-cycle regression
+- Anchor-based data integration to remove batch effects
+- UMAP dimensionality reduction and resolution-stable clustering
+- Cluster annotation using canonical immune lineage markers
+- T-cell subclustering and subtype identification
+- Pseudotime trajectory inference with Monocle3
+- Cell–cell communication network comparison with CellChat
+
+## Data requirement
+
+Download GSE142564 from NCBI GEO:
+<https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE142564>
+
+After extracting, update the paths in Section 2 to point to your local copy.
+
+## Conceptual foundation
+
+> **Why not just use bulk RNA-seq?**
+>
+> Bulk RNA-seq measures the *average* expression across all cells in a sample. In a bone
+> marrow sample containing T cells, B cells, macrophages, and progenitors, the average
+> signal is biologically meaningless — it represents no real cell. scRNA-seq resolves each
+> cell individually, revealing the heterogeneity that bulk methods collapse away. Rare
+> populations (circulating tumour cells, stem cells, regulatory T cells) that are <1% of
+> the sample are completely invisible to bulk RNA-seq but detectable with scRNA-seq.
+
+---
+
+# Environment Setup
+
+## Why these packages?
+
+Each package is selected for a specific role in the pipeline. The most important ones:
+
+- **Seurat** — the central analysis framework. Handles data loading, QC, normalisation,
+  integration, clustering, and visualisation. Think of the Seurat object as a filing cabinet
+  that stores every version of your data and every result in one place.
+- **Matrix** — sparse matrix support. A 20,000-gene × 10,000-cell count matrix has >90%
+  zeros. Storing it densely would require ~1.6 GB; sparse format needs ~50 MB. Without this,
+  most laptops cannot load the data at all.
+- **tidyverse** — `dplyr` for metadata manipulation, `ggplot2` for QC visualisation,
+  `stringr` for the critical mouse gene name conversion in cell cycle scoring.
+- **monocle3** — trajectory inference. Orders cells along a developmental path using a
+  principal graph fit through the UMAP embedding.
+- **CellChat** — cell–cell communication. Infers ligand–receptor interaction probabilities
+  from expression data and the CellChatDB.mouse reference database.
+
+```{r load-libraries}
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+library(clustree)   # For clustering resolution stability visualisation
+```
+
+```{r load-trajectory-libs, eval=FALSE}
+# Load trajectory and communication packages when needed (Sections 9 and 10)
+# Loaded here with eval=FALSE to avoid startup conflicts with Seurat
+library(monocle3)
+library(SeuratWrappers)
+library(CellChat)
+library(patchwork)
+library(ComplexHeatmap)
+```
+
+---
+
+# Data Loading and Initial Object Creation — Day 0
+
+## The 10X Genomics count matrix
+
+The 10X Genomics Chromium platform encapsulates single cells with barcoded gel beads in
+oil droplets (GEMs). Inside each GEM, the cell's mRNA is captured and tagged with:
+
+- A **16-nucleotide cell barcode** — unique to that gel bead, identifies the cell
+- A **12-nucleotide UMI** (Unique Molecular Identifier) — unique to each captured transcript,
+  used to collapse PCR duplicates
+
+CellRanger processes raw FASTQ reads and outputs three files per sample:
+
+| File | Contents | Represents |
+|---|---|---|
+| `barcodes.tsv.gz` | Cell barcode list | Column labels (cells) |
+| `features.tsv.gz` | Gene ID + name list | Row labels (genes) |
+| `matrix.mtx.gz` | Sparse UMI counts | Count matrix values |
+
+`Read10X()` reads all three simultaneously and returns a sparse matrix.
+
+> **Key insight:** The count matrix contains *UMIs*, not reads. Each UMI represents one
+> captured mRNA molecule. PCR duplicates (multiple reads from the same molecule) have already
+> been collapsed by CellRanger using the UMI sequence. This is why `nCount_RNA` in Seurat
+> is called UMI counts, not read counts.
+
+```{r load-day0}
+# ── UPDATE THIS PATH TO YOUR LOCAL DATA LOCATION ────────────────────────────────
+day0_path <- "/path/to/GSE142564_RAW/Day0/"
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Read10X() reads barcodes.tsv.gz + features.tsv.gz + matrix.mtx.gz simultaneously
+# Returns a dgCMatrix (sparse matrix): genes × cells
+data <- Read10X(day0_path)
+
+# Inspect dimensions before creating Seurat object
+cat("Matrix dimensions (genes × cells):", dim(data), "\n")
+cat("Total non-zero entries:", nnzero(data), "\n")
+cat("Sparsity:", round(100 * (1 - nnzero(data) / prod(dim(data))), 1), "%\n")
+```
+
+```{r create-seurat-day0}
+# CreateSeuratObject wraps the count matrix and automatically calculates:
+#   nCount_RNA  = total UMIs per cell  (sequencing depth)
+#   nFeature_RNA = number of genes detected per cell  (gene diversity)
+Day0 <- CreateSeuratObject(counts = data)
+
+# Print the Seurat object summary
+Day0
+
+# Inspect the metadata — this is the QC working table
+head(Day0@meta.data)
+```
+
+```{r initial-gene-filter}
+# Remove cells with fewer than 200 detected genes.
+#
+# WHY 200?
+# An empty droplet (no cell captured) or a dead cell fragment will have very few
+# detected genes — typically <100. Setting a floor of 200 removes the most obvious
+# debris while being conservative enough not to accidentally remove real cells.
+# This is a first pass; we will apply stricter thresholds after inspecting the data.
+
+Day0 <- subset(Day0, subset = nFeature_RNA >= 200)
+cat("Cells remaining after initial filter:", ncol(Day0), "\n")
+```
+
+---
+
+# Quality Control — Day 0
+
+## The three pillars of scRNA-seq QC
+
+Every cell must be evaluated on three axes simultaneously:
+
+1. **nCount_RNA** (UMI count) — sequencing depth. Too low = empty droplet or debris.
+   Too high = likely doublet (two cells in one droplet).
+2. **nFeature_RNA** (gene count) — transcriptional diversity. Too low = empty droplet,
+   red blood cell, or debris. Too high = likely doublet.
+3. **mitoRatio** (mitochondrial fraction) — cell health. High mitochondrial RNA indicates
+   the cell membrane has ruptured, allowing cytoplasmic RNA to leak out while mitochondria-
+   enclosed RNA is retained. These are dying cells.
+
+A fourth metric — **log10GenesPerUMI** — captures transcriptional complexity: how many
+unique genes are detected per total UMI count. Healthy, complex cells have high diversity.
+Empty droplets and red blood cells have low diversity (very few genes, many copies).
+
+## Mitochondrial fraction
+
+```{r calc-mito}
+# PercentageFeatureSet() sums UMIs from genes matching the pattern
+# and divides by total UMIs per cell, returning a percentage.
+#
+# Mouse mitochondrial genes are named with lowercase prefix: mt-Nd1, mt-Co1, etc.
+# Human mitochondrial genes use uppercase: MT-ND1, MT-CO1, etc.
+# Using the wrong prefix will silently return 0% for all cells — always verify!
+
+Day0$mitoRatio <- PercentageFeatureSet(object = Day0, pattern = "^mt-") / 100
+
+# Sanity check: verify mitochondrial genes are present in the dataset
+mito_genes_found <- grep("^mt-", rownames(Day0), value = TRUE)
+cat("Mitochondrial genes found:", length(mito_genes_found), "\n")
+cat("Examples:", head(mito_genes_found, 5), "\n")
+
+# If this prints 0 genes found, check whether your data uses ^MT- instead
+```
+
+## Complexity score
+
+```{r calc-complexity}
+# log10GenesPerUMI = log10(nFeature_RNA) / log10(nCount_RNA)
+#
+# This is a measure of transcriptional complexity (how many unique genes
+# a cell expresses relative to its total transcript count).
+#
+# INTUITION:
+# A cell expressing 1,000 unique genes across 5,000 total UMIs has high diversity.
+# A cell expressing 50 unique genes across 5,000 UMIs (e.g., a red blood cell
+# almost entirely expressing haemoglobin genes) has very low diversity.
+#
+# The log10/log10 form compresses the scale — values typically range from 0.7–1.0
+# for healthy cells. Empty droplets and RBCs cluster well below 0.82.
+
+Day0$log10GenesPerUMI <- log10(Day0$nFeature_RNA) / log10(Day0$nCount_RNA)
+
+# Quick summary of all QC metrics
+summary(Day0@meta.data[, c("nCount_RNA", "nFeature_RNA", "mitoRatio", "log10GenesPerUMI")])
+```
+
+## Visualise QC metrics BEFORE filtering
+
+> **This step is non-negotiable.**
+> You cannot choose appropriate thresholds without first seeing the distribution.
+> Thresholds from a paper or tutorial are for *their* data — your dataset may have
+> a completely different sequencing depth or mitochondrial profile. Always look first.
+
+```{r qc-violin-prefilter, fig.height=5}
+VlnPlot(
+  Day0,
+  features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"),
+  ncol  = 3,
+  layer = "counts",
+  pt.size = 0
+) +
+  plot_annotation(title = "QC Metrics — Day 0 (before filtering)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+## Metadata organisation
+
+```{r organise-metadata}
+# Extract the metadata dataframe, clean column names, and store a record
+# of the original counts before any filtering modifies them.
+
+metadata <- Day0@meta.data
+
+# Store cell barcodes as a column (they are row names by default, which is
+# not accessible after dplyr operations)
+metadata$cells <- rownames(metadata)
+
+# Label this sample
+metadata$sample <- "Day0"
+
+# Preserve original values before renaming (useful for auditing)
+metadata$orig_counts   <- metadata$nCount_RNA
+metadata$orig_features <- metadata$nFeature_RNA
+
+# Rename to more readable column names
+metadata <- metadata %>%
+  dplyr::rename(nUMI  = nCount_RNA,
+                nGene = nFeature_RNA)
+
+# Write back into the Seurat object
+Day0@meta.data <- metadata
+```
+
+## Round 1 filtering — remove doublets and dead cells
+
+```{r filter-round1}
+# Apply upper-bound filters to remove:
+#   - nFeature_RNA < 4000 : removes likely doublets (two cells = ~2× genes)
+#   - nCount_RNA < 20000  : removes cells with anomalously high sequencing depth
+#   - mitoRatio < 0.05    : removes cells with >5% mitochondrial reads (dying cells)
+#
+# NOTE ON THRESHOLDS:
+# These values were determined by inspecting the distributions above.
+# For your own dataset, adjust these based on what you observe.
+# A common mistake is using someone else's thresholds without looking at your data.
+
+before <- ncol(Day0)
+
+Day0 <- subset(
+  Day0,
+  nFeature_RNA < 4000 &
+    nCount_RNA  < 20000 &
+    mitoRatio   < 0.05
+)
+
+cat("Cells before Round 1 filter:", before, "\n")
+cat("Cells after  Round 1 filter:", ncol(Day0), "\n")
+cat("Removed:", before - ncol(Day0), "cells\n")
+```
+
+## Detailed QC distribution plots
+
+```{r qc-umi-density, fig.height=4}
+# UMI (sequencing depth) distribution
+# Plotted on log10 scale because the distribution spans several orders of magnitude.
+# The dashed vertical line at 2000 is a suggested lower threshold reference.
+# The final lower threshold used is nUMI > 3200 (applied in Round 2).
+
+metadata <- Day0@meta.data  # refresh after filtering
+
+metadata %>%
+  ggplot(aes(x = nUMI, fill = sample, color = sample)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_x_log10() +
+  geom_vline(xintercept = 2000, linetype = "dashed", linewidth = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Transcript Counts per Cell (Day 0)",
+       x = "nUMI (log10 scale)", y = "Cell Density")
+```
+
+```{r qc-gene-density, fig.height=4}
+# Gene count distribution
+# The dashed line at 1000 is a reference; final threshold is nGene > 900.
+# Cells far left of the main peak are likely empty droplets or debris.
+
+metadata %>%
+  ggplot(aes(x = nGene, fill = sample, color = sample)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_x_log10() +
+  geom_vline(xintercept = 1000, linetype = "dashed", linewidth = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Gene Counts per Cell (Day 0)",
+       x = "nGene (log10 scale)", y = "Cell Density")
+```
+
+```{r qc-mito-density, fig.height=4}
+# Mitochondrial ratio distribution
+# A healthy immune cell population shows >95% of cells below 0.05 (5%).
+# Any cells far to the right of the main peak are dying or damaged.
+
+metadata %>%
+  ggplot(aes(x = mitoRatio, fill = sample, color = sample)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  scale_x_log10() +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Mitochondrial Ratio Distribution (Day 0)",
+       x = "Mitochondrial Ratio", y = "Cell Density")
+```
+
+```{r qc-scatter, fig.height=5}
+# The most powerful single QC figure: UMI vs. Gene coloured by mitochondrial ratio.
+#
+# WHAT TO LOOK FOR:
+# - Healthy cells: tight linear cloud in the upper-right, coloured light grey (low mito)
+# - Dead cells: lower-left region, coloured dark (high mito) — low UMI, low genes, high mito
+# - Doublets: upper-right outliers beyond the main cloud — unusually high UMI AND gene counts
+# - Low-complexity cells (RBCs, empty drops): points BELOW the trend line — high UMI, low genes
+#
+# The red lines mark the Round 2 thresholds: nUMI > 3200 (vertical), nGene > 1000 (horizontal)
+
+metadata %>%
+  ggplot(aes(x = nUMI, y = nGene, color = mitoRatio)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  stat_smooth(method = "lm", color = "blue", se = TRUE, linetype = "dashed") +
+  scale_color_gradient(low = "gray90", high = "black") +
+  scale_x_log10() + scale_y_log10() +
+  geom_vline(xintercept = 3200, linetype = "dotted", color = "red", linewidth = 0.9) +
+  geom_hline(yintercept = 1000, linetype = "dotted", color = "red", linewidth = 0.9) +
+  facet_wrap(~sample) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "UMI vs. Gene Counts Coloured by Mitochondrial Ratio",
+       x = "nUMI", y = "nGene", color = "Mito Ratio")
+```
+
+```{r qc-complexity-density, fig.height=4}
+# Complexity score (log10GenesPerUMI) distribution
+# The threshold 0.82 removes cells below this complexity floor.
+# Red blood cells typically score ~0.6–0.75; healthy immune cells score >0.82.
+
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI, fill = sample, color = sample)) +
+  geom_density(alpha = 0.3, linewidth = 1) +
+  geom_vline(xintercept = 0.82, linetype = "dashed", linewidth = 1) +
+  scale_fill_brewer(palette = "Set1") +
+  scale_color_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  theme(legend.title = element_blank(), plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "Transcriptional Complexity Distribution (Day 0)",
+       x = "log10(Genes per UMI)", y = "Cell Density")
+```
+
+## Round 2 filtering — remove low-complexity and low-depth cells
+
+```{r filter-round2}
+# Apply lower-bound filters:
+#   log10GenesPerUMI > 0.82 : complexity floor (removes RBCs, empty droplets)
+#   nGene > 900             : minimum gene diversity
+#   nUMI > 3200             : minimum sequencing depth
+#
+# WHY TWO ROUNDS?
+# Round 1 removes obvious outliers at the top (doublets, dead cells).
+# Round 2, enabled by the diagnostic plots above, removes the subtler
+# low-quality cells at the bottom that passed the initial 200-gene floor.
+
+before <- ncol(Day0)
+
+Day0 <- subset(
+  x = Day0,
+  subset = (log10GenesPerUMI > 0.82) & (nGene > 900) & (nUMI > 3200)
+)
+
+cat("Cells before Round 2 filter:", before, "\n")
+cat("Cells after  Round 2 filter:", ncol(Day0), "\n")
+cat("Removed:", before - ncol(Day0), "cells\n")
+
+# Final QC check — distributions should now be clean and unimodal
+VlnPlot(Day0, features = c("nGene", "nUMI", "mitoRatio"), pt.size = 0) +
+  plot_annotation(title = "QC Metrics — Day 0 (AFTER filtering)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+---
+
+# Quality Control — Day 14
+
+> **Why repeat identical QC for every sample?**
+>
+> Batch effects, reagent variability, and sample handling differences mean that
+> the QC distributions are rarely identical across samples. Applying thresholds
+> globally (e.g., from one sample's distribution) can under-filter one sample
+> and over-filter another, introducing artificial transcriptional differences
+> between conditions *before* any biology has been measured.
+>
+> Always QC each sample independently and compare the cell counts and metric
+> distributions across samples before merging.
+
+```{r load-day14}
+# ── UPDATE THIS PATH TO YOUR LOCAL DATA LOCATION ────────────────────────────────
+day14_path <- "/path/to/GSE142564_RAW/Day14/"
+# ────────────────────────────────────────────────────────────────────────────────
+
+data_14 <- Read10X(day14_path)
+cat("Day14 matrix dimensions:", dim(data_14), "\n")
+
+Day14 <- CreateSeuratObject(counts = data_14)
+Day14 <- subset(Day14, subset = nFeature_RNA >= 200)
+cat("Cells after initial filter:", ncol(Day14), "\n")
+```
+
+```{r qc-metrics-day14}
+# Calculate QC metrics — identical to Day0
+Day14$mitoRatio <- PercentageFeatureSet(object = Day14, pattern = "^mt-") / 100
+
+# Verify mitochondrial genes are present (same check as Day0)
+mito_day14 <- grep("^mt-", rownames(Day14), value = TRUE)
+cat("Mitochondrial genes in Day14:", length(mito_day14), "\n")
+
+Day14$log10GenesPerUMI <- log10(Day14$nFeature_RNA) / log10(Day14$nCount_RNA)
+
+summary(Day14@meta.data[, c("nCount_RNA", "nFeature_RNA", "mitoRatio", "log10GenesPerUMI")])
+```
+
+```{r qc-violin-day14-pre, fig.height=5}
+# ALWAYS inspect the Day14 distribution before applying any thresholds.
+# Compare to the Day0 violin plots above — do they look similar?
+# Large differences in nUMI or nGene distributions between samples
+# may indicate a batch effect or sample quality difference.
+
+VlnPlot(
+  Day14,
+  features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"),
+  ncol = 3,
+  layer = "counts",
+  pt.size = 0
+) +
+  plot_annotation(title = "QC Metrics — Day 14 (before filtering)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+```{r organise-metadata-day14}
+# Identical metadata organisation as Day0
+metadata_14 <- Day14@meta.data
+metadata_14$cells          <- rownames(metadata_14)
+metadata_14$sample         <- "Day14"
+metadata_14$orig_counts    <- metadata_14$nCount_RNA
+metadata_14$orig_features  <- metadata_14$nFeature_RNA
+
+metadata_14 <- metadata_14 %>%
+  dplyr::rename(nUMI  = nCount_RNA,
+                nGene = nFeature_RNA)
+
+Day14@meta.data <- metadata_14
+```
+
+```{r qc-scatter-day14, fig.height=5}
+# The UMI vs. Gene scatter for Day14 — compare the cloud shape to Day0.
+# Both samples should show similar linear relationships if sample quality is consistent.
+# Red lines are the same thresholds as Day0 (adjust if Day14's distribution differs).
+
+metadata_14 %>%
+  ggplot(aes(x = nUMI, y = nGene, color = mitoRatio)) +
+  geom_point(alpha = 0.6, size = 0.8) +
+  stat_smooth(method = "lm", color = "blue", se = TRUE, linetype = "dashed") +
+  scale_color_gradient(low = "gray90", high = "black") +
+  scale_x_log10() + scale_y_log10() +
+  geom_vline(xintercept = 3200, linetype = "dotted", color = "red", linewidth = 0.9) +
+  geom_hline(yintercept = 1000, linetype = "dotted", color = "red", linewidth = 0.9) +
+  facet_wrap(~sample) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right", plot.title = element_text(hjust = 0.5, face = "bold")) +
+  labs(title = "UMI vs. Gene Counts Coloured by Mitochondrial Ratio — Day 14",
+       x = "nUMI", y = "nGene", color = "Mito Ratio")
+```
+
+```{r filter-day14}
+# Round 1: Remove doublets and dead cells
+before_14 <- ncol(Day14)
+Day14 <- subset(Day14, nFeature_RNA < 4000 & nCount_RNA < 20000 & mitoRatio < 0.05)
+cat("After Round 1 — removed:", before_14 - ncol(Day14), "cells, remaining:", ncol(Day14), "\n")
+
+# Round 2: Remove low-complexity and low-depth cells
+before_14b <- ncol(Day14)
+Day14 <- subset(x = Day14, subset = (log10GenesPerUMI > 0.82) & (nGene > 900) & (nUMI > 3200))
+cat("After Round 2 — removed:", before_14b - ncol(Day14), "cells, remaining:", ncol(Day14), "\n")
+```
+
+```{r qc-violin-day14-post, fig.height=5}
+VlnPlot(Day14, features = c("nGene", "nUMI", "mitoRatio"), pt.size = 0) +
+  plot_annotation(title = "QC Metrics — Day 14 (AFTER filtering)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+```{r qc-comparison}
+# Compare final cell counts and QC distributions between samples
+# This is the first inter-sample quality check
+
+cat("\n=== QC Summary ===\n")
+cat("Day0  — cells:", ncol(Day0),  " | median nUMI:", median(Day0$nUMI),
+    " | median nGene:", median(Day0$nGene), "\n")
+cat("Day14 — cells:", ncol(Day14), " | median nUMI:", median(Day14$nUMI),
+    " | median nGene:", median(Day14$nGene), "\n")
+
+# Large differences in cell count or depth between samples are a warning sign
+# of a potential batch effect that will require correction in the integration step.
+```
+
+---
+
+# Merging, Gene Filtering, and BCR/TCR Removal
+
+## Merging both samples
+
+```{r rename-and-merge}
+# RenameCells adds a prefix to every cell barcode.
+# WHY IS THIS NECESSARY?
+# Cell barcodes from 10X are not globally unique — the same 16-nt sequence
+# can appear in both Day0 and Day14. Without prefixing, merge() would either
+# deduplicate the barcodes (losing cells) or throw an error.
+# After renaming: "ACGTACGT-1" becomes "Day0_ACGTACGT-1" or "Day14_ACGTACGT-1"
+
+Day0  <- RenameCells(Day0,  add.cell.id = "Day0")
+Day14 <- RenameCells(Day14, add.cell.id = "Day14")
+
+# merge() concatenates two Seurat objects.
+# IMPORTANT: merge() is NOT integration.
+# After merging, if you run PCA, cells will still cluster by sample (batch) not biology.
+# Integration (Section 7) is required to correct for this.
+
+merged <- merge(x = Day0, y = c(Day14))
+
+cat("Total cells after merging:", ncol(merged), "\n")
+cat("Cells per sample:\n")
+print(table(merged$sample))
+```
+
+## Remove BCR and TCR variable genes
+
+```{r remove-bcr-tcr}
+# In a bone marrow immune dataset, immunoglobulin (Ig) variable genes and
+# T-cell receptor (TCR) genes will be among the most variable genes.
+#
+# WHY IS THIS A PROBLEM?
+# Each B cell expresses a unique V(D)J recombination product (e.g., Ighv1-26).
+# Each T cell expresses unique TCR chains. These are clonotype-specific, not
+# transcriptional-state-specific. If left in, PCA and UMAP will group cells
+# by their clonotype (receptor sequence) rather than their functional state.
+# This makes it appear that you have many more biologically distinct populations
+# than actually exist, and hides real transcriptional differences.
+#
+# REGEX PATTERNS:
+#   ^Ig[hkl]v  — Immunoglobulin heavy/kappa/lambda variable genes
+#   ^Ig[hkl]j  — Immunoglobulin joining genes
+#   ^Ig[kl]c   — Immunoglobulin constant genes (kappa and lambda)
+#   ^Igh[adegm]— Heavy chain isotype constants (IgA, IgD, IgE, IgG, IgM)
+#   ^Tr[abdg][vjc] — TCR alpha/beta/delta/gamma variable/joining/constant
+
+before_genes <- nrow(merged)
+
+merged <- merged[!grepl("^Ig[hkl]v",   rownames(merged), ignore.case = FALSE), ]
+merged <- merged[!grepl("^Ig[hkl]j",   rownames(merged), ignore.case = FALSE), ]
+merged <- merged[!grepl("^Ig[kl]c",    rownames(merged), ignore.case = FALSE), ]
+merged <- merged[!grepl("^Igh[adegm]", rownames(merged), ignore.case = FALSE), ]
+merged <- merged[!grepl("^Tr[abdg][vjc]", rownames(merged), ignore.case = FALSE), ]
+
+cat("Genes before BCR/TCR removal:", before_genes, "\n")
+cat("Genes after  BCR/TCR removal:", nrow(merged), "\n")
+cat("Removed:", before_genes - nrow(merged), "BCR/TCR genes\n")
+```
+
+## Remove sparsely expressed genes
+
+```{r filter-sparse-genes}
+# Genes expressed in <10 cells contribute primarily noise to variable gene
+# selection and PCA. Removing them:
+#   1. Reduces dimensionality (faster computation)
+#   2. Improves signal-to-noise ratio
+#   3. Removes features that are too sparse for meaningful statistical testing
+
+# Seurat v5 stores counts in layers; JoinLayers collapses them into one matrix
+merged[["RNA"]] <- JoinLayers(merged[["RNA"]])
+
+# Extract the count matrix
+counts <- LayerData(merged, assay = "RNA", layer = "counts")
+
+# Create a logical (TRUE/FALSE) matrix: is this gene expressed in this cell?
+nonzero <- counts > 0
+
+# Count how many cells express each gene
+cells_per_gene <- Matrix::rowSums(nonzero)
+
+# Keep only genes expressed in at least 10 cells
+keep_genes <- cells_per_gene >= 10
+
+cat("Genes before sparse filter:", nrow(merged), "\n")
+cat("Genes expressed in ≥10 cells:", sum(keep_genes), "\n")
+cat("Genes removed:", sum(!keep_genes), "\n")
+
+# Subset the count matrix and rebuild the Seurat object
+# (CreateSeuratObject preserves metadata via the meta.data argument)
+dual_counts <- counts[keep_genes, ]
+merged <- CreateSeuratObject(dual_counts, meta.data = merged@meta.data)
+
+cat("Final merged object:", nrow(merged), "genes ×", ncol(merged), "cells\n")
+```
+
+---
+
+# Cell Cycle Scoring
+
+## Why cell cycle matters
+
+Proliferating cells (in S phase or G2/M phase) have a distinct transcriptional signature —
+they upregulate hundreds of genes involved in DNA replication and mitosis. In a dataset
+with cycling and non-cycling cells, this signature can dominate the first principal
+components, causing cells to cluster by their cell cycle phase rather than their cell type.
+
+The strategy here is to:
+1. **Score** every cell for S-phase and G2M-phase gene expression
+2. **Regress** these scores out as covariates in SCTransform (next section)
+
+This removes cell cycle as a source of variation while preserving the genuine
+transcriptional differences between cell types.
+
+```{r cell-cycle-scoring}
+# A preliminary log-normalisation is required before CellCycleScoring()
+# because the scoring uses gene expression levels, not raw counts.
+# This normalisation is temporary — SCTransform replaces it in Section 7.
+
+merged <- NormalizeData(merged)
+
+# CRITICAL MOUSE/HUMAN CONVERSION:
+# Seurat's built-in cc.genes list uses HUMAN gene symbols in ALL CAPS (e.g., PCNA, TOP2A).
+# Mouse gene symbols use Title Case (e.g., Pcna, Top2a).
+# str_to_title() converts: "PCNA" → "Pcna", "TOP2A" → "Top2a"
+# Without this conversion, scoring silently returns 0 scores for ALL cells.
+
+s.genes   <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+
+cat("S-phase genes (first 5):", head(s.genes, 5), "\n")
+cat("G2M-phase genes (first 5):", head(g2m.genes, 5), "\n")
+
+merged <- CellCycleScoring(
+  merged,
+  g2m.features = g2m.genes,
+  s.features   = s.genes,
+  set.ident    = TRUE   # Set active identity to predicted phase (G1/S/G2M)
+)
+
+# Visualise canonical cell cycle marker expression across predicted phases
+# These should show phase-specific enrichment if scoring worked correctly:
+#   PCNA (Pcna) — DNA clamp loader, S phase
+#   TOP2A (Top2a) — DNA topoisomerase, G2M phase
+#   MCM6 (Mcm6) — DNA replication helicase, S phase
+#   MKI67 (Mki67) — proliferation marker, G2M phase
+
+RidgePlot(
+  merged,
+  features = c("Pcna", "Top2a", "Mcm6", "Mki67"),
+  ncol = 2
+) +
+  plot_annotation(title = "Cell Cycle Marker Expression by Phase",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+```{r cell-cycle-pca, fig.height=5}
+# Run a diagnostic PCA BEFORE SCTransform to see how much cell cycle drives variation.
+# If cells separate by phase on PC1/PC2, regression is necessary.
+
+merged <- FindVariableFeatures(merged, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+merged <- ScaleData(merged)
+merged <- RunPCA(merged, verbose = FALSE)
+
+DimPlot(
+  merged,
+  reduction = "pca",
+  group.by  = "Phase",
+  split.by  = "Phase"
+) +
+  plot_annotation(title = "PCA Coloured by Cell Cycle Phase (before regression)",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+
+# If G1, S, and G2M cells separate on PC1 or PC2, the regression is working as intended.
+# After SCTransform with vars.to.regress, this separation should disappear.
+```
+
+---
+
+# SCTransform Normalisation and Data Integration
+
+## Why SCTransform instead of log-normalisation?
+
+Log-normalisation (dividing each cell's counts by total UMIs, then log-transforming) is
+simple but imperfect. It corrects for sequencing depth but not for RNA composition effects
+or the overdispersion inherent in count data.
+
+**SCTransform** fits a regularised negative binomial regression for each gene:
+
+```
+log(E[counts]) = β₀ + β₁ × log(nUMI) + β₂ × S.Score + β₃ × G2M.Score
+```
+
+The residuals from this model are the normalised values — they represent expression
+*after removing* the effect of sequencing depth and cell cycle. This is more statistically
+principled because count data genuinely follows a negative binomial distribution.
+
+```{r sctransform}
+# Split the merged object back into per-sample objects before normalising.
+# WHY PER SAMPLE?
+# If you run SCTransform on the merged object, the model will fit a single
+# depth-expression relationship across both samples simultaneously. If the
+# samples have different sequencing depths (a batch effect), this conflates
+# biological signal with technical variation in the normalised values.
+# Running per sample first, then integrating, keeps these steps cleanly separated.
+
+split_seurat <- SplitObject(merged, split.by = "sample")
+
+# SCTransform is memory-intensive. This line raises the ceiling for
+# objects passed to parallel worker processes. 8 GB is appropriate for
+# datasets of ~5,000–20,000 cells. Scale up for larger experiments.
+options(future.globals.maxSize = 8 * 1024^3)
+
+cat("Samples to normalise:", names(split_seurat), "\n")
+
+for (i in seq_along(split_seurat)) {
+  cat("\nRunning SCTransform on sample:", names(split_seurat)[i], "\n")
+
+  split_seurat[[i]] <- SCTransform(
+    split_seurat[[i]],
+    vars.to.regress = c("S.Score", "G2M.Score"),  # Regress out cell cycle
+    verbose = FALSE
+  )
+  # Each object now has a new 'SCT' assay slot with:
+  #   - scale.data : Pearson residuals (normalised, used for PCA)
+  #   - data       : log1p-transformed counts (used for visualisation)
+  #   - counts     : corrected counts (for downstream use)
+}
+
+cat("\nSCTransform complete.\n")
+cat("Assays in object:", Assays(split_seurat[[1]]), "\n")
+```
+
+## Anchor-based integration
+
+```{r integration}
+# Seurat's integration strategy:
+#
+# 1. SelectIntegrationFeatures() — identifies 3000 genes that are highly variable
+#    in ALL samples (not just one). These are the anchor features.
+#
+# 2. PrepSCTIntegration() — pre-processes the SCT residuals for anchor finding.
+#
+# 3. FindIntegrationAnchors() — finds "anchor" pairs: cells that are mutual
+#    nearest neighbours in expression space across samples. These are cells
+#    that are biologically equivalent despite coming from different samples.
+#    Think of them as landmarks shared across the two datasets.
+#
+# 4. IntegrateData() — uses the anchor pairs to compute correction vectors and
+#    project all cells into a shared embedding that removes batch-specific variation.
+
+bm.features <- SelectIntegrationFeatures(
+  object.list = split_seurat,
+  nfeatures   = 3000
+)
+
+bm.list <- PrepSCTIntegration(
+  object.list     = split_seurat,
+  anchor.features = bm.features
+)
+
+bm.anchors <- FindIntegrationAnchors(
+  object.list          = bm.list,
+  normalization.method = "SCT",
+  anchor.features      = bm.features
+)
+
+# MEMORY MANAGEMENT: Integration is the most RAM-intensive step.
+# Remove all objects except bm.anchors before proceeding.
+# On a 32 GB machine this typically requires ~20 GB of free RAM.
+cat("Freeing memory before integration...\n")
+remove(list = setdiff(ls(), c("bm.anchors", "split_seurat")))
+gc()
+
+bm.integrated <- IntegrateData(
+  anchorset            = bm.anchors,
+  normalization.method = "SCT"
+)
+
+# After integration, the 'integrated' assay contains batch-corrected values.
+# Use 'integrated' for: PCA, UMAP, FindNeighbors, FindClusters
+# Use 'RNA' for: gene expression quantification, FindAllMarkers, FeaturePlot values
+
+DefaultAssay(bm.integrated) <- "integrated"
+
+cat("Integration complete.\n")
+cat("Assays available:", Assays(bm.integrated), "\n")
+```
+
+---
+
+# Dimensionality Reduction and Clustering
+
+## PCA and number of dimensions
+
+```{r pca}
+bm.integrated <- RunPCA(object = bm.integrated, verbose = FALSE)
+
+# The ElbowPlot shows the standard deviation (variance explained) of each PC.
+# The "elbow" — where the curve bends and flattens — indicates that additional
+# PCs are capturing noise rather than signal.
+# For this dataset, 20 PCs is chosen. The exact number matters less than ensuring
+# you include enough PCs to capture all major cell types.
+
+ElbowPlot(bm.integrated, ndims = 50) +
+  geom_vline(xintercept = 20, linetype = "dashed", color = "red") +
+  labs(title = "Elbow Plot — Variance Explained by PC",
+       subtitle = "Red line = chosen dimensionality (20 PCs)")
+```
+
+## UMAP embedding
+
+```{r umap}
+# UMAP (Uniform Manifold Approximation and Projection) compresses the 20-PC
+# embedding into a 2D visualisation that preserves LOCAL neighbourhood structure.
+#
+# KEY WARNINGS ABOUT UMAP:
+#   - Distances BETWEEN clusters are NOT interpretable. Two distant clusters on the UMAP
+#     may be transcriptionally similar. Two adjacent clusters may be very different.
+#   - Only LOCAL structure (within-cluster and immediate neighbours) is meaningful.
+#   - UMAP is for VISUALISATION only. Always use PCA space for FindNeighbors() and
+#     FindClusters() — never use UMAP coordinates for these steps.
+
+bm.integrated <- RunUMAP(
+  object  = bm.integrated,
+  dims    = 1:20,
+  verbose = FALSE
+)
+```
+
+## Graph construction and clustering
+
+```{r clustering}
+# FindNeighbors() builds a k-nearest-neighbour (KNN) graph in PCA space.
+# Each cell is connected to its k most transcriptionally similar neighbours.
+# This graph is the mathematical input to the community detection algorithm.
+
+bm.integrated <- FindNeighbors(
+  bm.integrated,
+  reduction = "pca",
+  dims      = 1:20,
+  verbose   = FALSE
+)
+
+# FindClusters() applies the Leiden/Louvain community detection algorithm.
+# We test 20 different resolution values (0.1 to 2.0) simultaneously.
+#
+# WHY TEST MULTIPLE RESOLUTIONS?
+# Resolution controls the number of clusters: low resolution = few large clusters;
+# high resolution = many small clusters. There is no objectively "correct" resolution —
+# it depends on the biological question and the dataset.
+# Testing many resolutions and visualising stability with clustree (below) allows
+# an informed choice rather than an arbitrary one.
+
+bm.integrated <- FindClusters(
+  bm.integrated,
+  resolution = c(seq(from = 0.1, to = 2.0, by = 0.1)),
+  verbose    = FALSE
+)
+
+cat("Clustering columns added to metadata (one per resolution):\n")
+print(head(grep("integrated_snn_res", colnames(bm.integrated@meta.data), value = TRUE)))
+```
+
+```{r clustree, fig.height=8}
+# clustree visualises how cells move between clusters as resolution increases.
+# A stable cluster at a given resolution will have a thick, consistent branch
+# in the tree with no cells migrating away at small resolution changes.
+#
+# CHOOSING RESOLUTION:
+# Select the LOWEST resolution at which biologically distinct populations emerge
+# as separate clusters. Going higher gives you more clusters, but at the cost of
+# splitting genuinely homogeneous populations artificially.
+
+library(clustree)
+
+clustree(
+  x      = bm.integrated,
+  prefix = "integrated_snn_res."
+) +
+  labs(title = "Clustering Stability Across Resolutions (20 PCs)")
+```
+
+```{r set-resolution}
+# Based on the clustree output, resolution 0.1 is selected for this dataset.
+# At this resolution, the main immune lineages are well separated without
+# over-splitting within cell types.
+
+Idents(bm.integrated) <- "integrated_snn_res.0.1"
+
+cat("Number of clusters at resolution 0.1:",
+    length(levels(Idents(bm.integrated))), "\n")
+```
+
+## Integration quality control
+
+```{r umap-overall, fig.height=5}
+# UMAP 1: Overall cluster assignments
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  label     = TRUE,
+  label.size = 5
+) +
+  NoLegend() +
+  labs(title = "Integrated UMAP — Cluster Assignments (resolution 0.1)")
+```
+
+```{r umap-by-sample, fig.height=5}
+# UMAP 2: Split by sample — the KEY integration QC plot.
+#
+# SUCCESS: Day0 and Day14 cells co-occupy the same cluster positions.
+#          Each cluster contains cells from both time points.
+# FAILURE: Day0 cells and Day14 cells form separate UMAP regions.
+#          This means integration did not remove the batch effect.
+#
+# If this plot shows failure, consider: Harmony integration, increasing nfeatures,
+# or checking whether the samples are biologically too different to integrate.
+
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  split.by  = "sample",
+  label     = TRUE
+) +
+  labs(title = "Integrated UMAP — Split by Sample")
+```
+
+```{r umap-by-phase, fig.height=5}
+# UMAP 3: Split by cell cycle phase — confirms cell cycle regression worked.
+#
+# SUCCESS: G1, S, and G2M cells are distributed across all clusters (not separated).
+# FAILURE: S and G2M cells form their own cluster(s), separate from G1 cells.
+#          This means cell cycle regression did not fully remove the effect.
+
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  split.by  = "Phase",
+  label     = TRUE
+) +
+  labs(title = "Integrated UMAP — Split by Cell Cycle Phase")
+```
+
+---
+
+# Cluster Annotation
+
+## Switching to the RNA assay
+
+```{r switch-to-rna}
+# IMPORTANT ASSAY SWITCH:
+# The 'integrated' assay corrects for batch effects but distorts absolute expression values.
+# It is suitable for: clustering, UMAP, dimensionality reduction.
+# It is NOT suitable for: differential expression, marker gene quantification, FeaturePlot.
+#
+# Always switch back to 'RNA' before running FindAllMarkers() or FeaturePlot().
+
+DefaultAssay(bm.integrated) <- "RNA"
+
+# Log-normalise the RNA assay
+bm.integrated <- NormalizeData(
+  object               = bm.integrated,
+  scale.factor         = 10000,
+  normalization.method = "LogNormalize"
+)
+
+# Scale all genes in the RNA assay
+# (ScaleData is required before DoHeatmap — it is not the same as SCTransform scaling)
+bm.integrated <- ScaleData(
+  object   = bm.integrated,
+  features = rownames(bm.integrated)
+)
+
+# Join layers (required in Seurat v5 before FindAllMarkers)
+bm.integrated <- JoinLayers(bm.integrated)
+```
+
+## Canonical lineage marker expression
+
+```{r feature-plot-markers, fig.height=7}
+# These four markers cover the major immune lineages expected in bone marrow:
+#   Cd3e   — Pan-T cell (part of the TCR signalling complex)
+#   Cd19   — B cell (B cell receptor coreceptor)
+#   Adgre1 — Macrophage (F4/80, a well-established mouse macrophage marker)
+#   Cd14   — Monocyte (LPS co-receptor; lower on tissue-resident macrophages)
+#
+# order = TRUE ensures cells expressing the gene are plotted on top,
+# making positive cells visible even in dense UMAP regions.
+
+FeaturePlot(
+  bm.integrated,
+  features = c("Cd3e", "Cd19", "Adgre1", "Cd14"),
+  label    = TRUE,
+  ncol     = 2,
+  order    = TRUE
+) +
+  plot_annotation(title = "Canonical Lineage Marker Expression",
+                  theme = theme(plot.title = element_text(hjust = 0.5, face = "bold")))
+```
+
+```{r dot-plot-markers, fig.height=4}
+# DotPlot encodes two dimensions of information simultaneously:
+#   - Dot SIZE    = percentage of cells in that cluster expressing the gene (% expressed)
+#   - Dot COLOUR  = average expression level in expressing cells (scaled expression)
+#
+# A cluster that is truly a B cell should show large, dark dots for Cd19
+# and small, light dots for Cd3e, Adgre1, and Cd14.
+
+DotPlot(
+  bm.integrated,
+  features = c("Cd3e", "Cd19", "Adgre1", "Cd14")
+) +
+  RotatedAxis() +
+  labs(title = "Lineage Marker DotPlot — Size = % Expressing, Colour = Avg Expression")
+```
+
+## FindAllMarkers — data-driven cluster annotation
+
+```{r find-all-markers}
+# FindAllMarkers() tests each gene for differential expression in each cluster
+# versus all other clusters combined (one-vs-rest).
+#
+# KEY PARAMETER CHOICES:
+#
+# logfc.threshold = 0.25
+#   Pre-filters to genes with at least 0.25 log2FC difference.
+#   This speeds up the test by skipping genes unlikely to be significant.
+#   It does NOT mean we only care about large fold-changes — the FDR filter below
+#   handles statistical significance separately from biological effect size.
+#
+# test.use = "negbinom"
+#   Negative binomial test accounts for the overdispersion in count data.
+#   scRNA-seq counts are more variable than Poisson predicts (many zeros, occasional
+#   very high counts). The negative binomial model fits this better.
+#   Default is Wilcoxon (faster but ignores count distribution structure).
+#
+# only.pos = TRUE
+#   Returns only upregulated markers per cluster. Downregulated genes are less
+#   useful for defining what a cluster IS (they tell you what it is NOT).
+#
+# return.thresh = 0.05
+#   Pre-filters to FDR-adjusted p-value < 0.05 before returning results.
+
+markers <- FindAllMarkers(
+  object          = bm.integrated,
+  logfc.threshold = 0.25,
+  test.use        = "negbinom",
+  only.pos        = TRUE,
+  return.thresh   = 0.05,
+  verbose         = FALSE
+)
+
+# Remove any rows where p_val_adj == 0 (a Seurat artefact in some versions
+# where cells with identical expression profiles generate exact p = 0)
+markers <- markers %>%
+  dplyr::filter(p_val_adj > 0 & p_val_adj < 0.05)
+
+cat("Significant markers found:", nrow(markers), "\n")
+cat("Markers per cluster:\n")
+print(table(markers$cluster))
+```
+
+```{r top10-heatmap, fig.height=8}
+# Select top 10 markers per cluster ranked by average log2 fold-change
+top10 <- markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::ungroup()
+
+seurat_integrated <- bm.integrated  # Alias for clarity
+
+# DoHeatmap shows the scaled expression of top10 marker genes across all cells,
+# grouped by cluster. Each column is a cell; each row is a gene.
+# A well-annotated cluster should show a distinct block of high expression
+# for its marker genes.
+
+DoHeatmap(seurat_integrated, features = top10$gene) +
+  NoLegend() +
+  labs(title = "Top 10 Marker Genes per Cluster")
+```
+
+```{r dotplot-top-markers, fig.height=6}
+DotPlot(seurat_integrated, features = unique(top10$gene)) +
+  RotatedAxis() +
+  labs(title = "Top Marker Gene DotPlot")
+```
+
+---
+
+# T-cell Subclustering
+
+## Why subcluster?
+
+At the whole-dataset clustering resolution (0.1), the T-cell population appears as a single
+cluster. However, T cells are a functionally heterogeneous group:
+
+- **CD8+ Cytotoxic T cells** — direct cell killing
+- **CD4+ Th17 cells** — inflammatory IL-17 producers
+- **Regulatory T cells (Tregs)** — immune suppression via FOXP3
+- **γδ T cells (IL-17a+)** — innate-like, express IL-17a and Trgv2
+- **γδ T cells (IL-17a−)** — cycling/proliferating, express Top2a and Birc5
+
+Subclustering applies the entire clustering pipeline *only to T cells*, at a finer
+resolution, revealing subtypes invisible at the whole-dataset scale.
+
+```{r t-cell-subset}
+# Subset cluster 3 (identified as T cells based on Cd3e FeaturePlot above)
+# IMPORTANT: Verify the T-cell cluster number in YOUR data before subsetting.
+# Run: FeaturePlot(seurat_integrated, features = "Cd3e") to confirm.
+
+T_cell <- subset(
+  seurat_integrated,
+  subset = integrated_snn_res.0.1 == "3"
+)
+
+cat("T cells extracted:", ncol(T_cell), "cells\n")
+
+# Use the integrated assay for subclustering (same rationale as main clustering)
+DefaultAssay(T_cell) <- "integrated"
+```
+
+```{r t-cell-clustering}
+# Run the full clustering pipeline on the T-cell subset
+T_cell <- RunUMAP(T_cell, dims = 1:20, verbose = FALSE)
+T_cell <- FindNeighbors(T_cell, reduction = "pca", dims = 1:20, verbose = FALSE)
+T_cell <- FindClusters(T_cell, resolution = c(seq(0.1, 2.0, by = 0.1)), verbose = FALSE)
+
+# Assess resolution stability
+clustree(x = T_cell, prefix = "integrated_snn_res.") +
+  labs(title = "T-cell Subclustering Stability (clustree)")
+```
+
+```{r t-cell-set-resolution}
+# Resolution 0.2 is selected for T-cell subclustering
+Idents(T_cell) <- "integrated_snn_res.0.2"
+
+DimPlot(T_cell, label = TRUE, label.size = 5) +
+  NoLegend() +
+  labs(title = "T-cell Subcluster UMAP (resolution 0.2)")
+```
+
+## T-cell subtype marker visualisation
+
+```{r t-cell-rna-norm}
+# Switch to RNA assay for marker gene quantification
+DefaultAssay(T_cell) <- "RNA"
+T_cell <- NormalizeData(T_cell, scale.factor = 10000, verbose = FALSE)
+T_cell <- ScaleData(T_cell, features = rownames(T_cell), verbose = FALSE)
+T_cell <- JoinLayers(T_cell)
+```
+
+```{r t-cell-dotplot, fig.height=6}
+# Named list of marker genes per T-cell subtype
+# The list structure allows DotPlot to group genes by their biological category
+tcell_clusters <- list(
+  Cytotoxic_T_cells        = c("Lef1", "Ms4a4b", "Cd8a"),
+  Th17_cells               = c("Tnfsf8", "Cxcr6", "Cd4", "Il17a", "Rora"),
+  Regulatory_T_cells       = c("Foxp3", "Ctla4"),
+  Il17a_positive_gdT_cells = c("Il23r", "Trgv2"),
+  Il17a_negative_gdT_cells = c("Birc5", "Top2a")
+)
+
+DotPlot(T_cell, features = tcell_clusters) +
+  RotatedAxis() +
+  labs(title = "T-cell Subtype Marker DotPlot",
+       subtitle = "Size = % expressing | Colour = scaled expression")
+```
+
+---
+
+# Trajectory Inference with Monocle3
+
+## What is pseudotime?
+
+Pseudotime is not real time. It is an abstract axis that orders cells from
+transcriptionally "early" (closest to the root state) to transcriptionally "late"
+(furthest from the root). The ordering is based on transcriptional similarity —
+cells that are most similar to their neighbours form a continuous path.
+
+Monocle3 learns a **principal graph** through the UMAP embedding — a mathematical
+skeleton that captures the trajectory topology — and then assigns each cell a
+distance along this graph from the chosen root node.
+
+```{r trajectory-setup, eval=FALSE}
+# Load trajectory packages
+library(monocle3)
+library(SeuratWrappers)
+
+DefaultAssay(T_cell) <- "integrated"
+
+# Convert Seurat → Monocle3 cell_data_set (CDS) object
+# SeuratWrappers::as.cell_data_set() transfers: counts, UMAP, PCA, cluster labels
+bm.integrated.cds <- as.cell_data_set(
+  T_cell,
+  group.by = "integrated_snn_res.0.2"
+)
+
+# Re-cluster within Monocle3 (required for learn_graph)
+bm.integrated.cds <- cluster_cells(
+  cds              = bm.integrated.cds,
+  reduction_method = "UMAP"
+)
+
+# Learn the principal graph through the UMAP embedding
+# use_partition = TRUE restricts the trajectory to each connected UMAP partition,
+# preventing biologically disconnected states from being linked.
+bm.integrated.cds <- learn_graph(
+  bm.integrated.cds,
+  use_partition = TRUE
+)
+
+# Visualise the trajectory graph overlaid on the UMAP
+plot_cells(
+  cds                    = bm.integrated.cds,
+  show_trajectory_graph  = TRUE,
+  color_cells_by         = "cluster",
+  label_groups_by_cluster = TRUE
+)
+```
+
+```{r pseudotime, eval=FALSE}
+# order_cells() assigns pseudotime values.
+# This step opens an interactive Shiny browser window — you must manually click
+# to select the ROOT NODE (the biological starting state of the trajectory).
+#
+# HOW TO CHOOSE THE ROOT:
+# 1. Look at the T-cell subtype DotPlot from Section 8.
+# 2. Identify which cluster expresses the LEAST differentiated markers.
+#    For T cells, naive T cells or early precursors are the logical root.
+# 3. In the interactive window, click on that cluster.
+#
+# If running non-interactively (e.g., in a pipeline), specify the root programmatically:
+#   bm.integrated.cds <- order_cells(bm.integrated.cds, root_cells = <barcode vector>)
+
+bm.integrated.cds <- order_cells(
+  bm.integrated.cds,
+  reduction_method = "UMAP"
+)
+
+# Colour cells by pseudotime
+# Cells close to the root (early) appear dark; cells far from root (late) appear light.
+plot_cells(
+  cds                   = bm.integrated.cds,
+  color_cells_by        = "pseudotime",
+  show_trajectory_graph = TRUE
+) +
+  labs(title = "T-cell Pseudotime Trajectory",
+       subtitle = "Dark = early (root), Light = late (differentiated)")
+```
+
+---
+
+# Cell–Cell Communication Analysis (CellChat)
+
+## The biological question
+
+Which ligand–receptor interactions occur between cell populations at Day 0 and Day 14?
+Do any signalling pathways change between the two time points?
+
+CellChat answers this by:
+1. Identifying ligand–receptor (L-R) pairs where both ligand AND receptor are
+   overexpressed in the relevant cell populations
+2. Computing a communication probability using a mass-action model based on
+   the CellChatDB.mouse database (~600 curated L-R interactions)
+3. Aggregating L-R pairs to the signalling pathway level
+4. Comparing the resulting networks between Day 0 and Day 14
+
+```{r cellchat-setup, eval=FALSE}
+library(CellChat)
+library(patchwork)
+options(stringsAsFactors = FALSE)
+
+# Split the integrated Seurat object back into per-sample objects
+split_seurat_cc <- SplitObject(bm.integrated, split.by = "sample")
+split_seurat_cc <- split_seurat_cc[c("Day0", "Day14")]
+```
+
+```{r cellchat-day0, eval=FALSE}
+Day0_cc <- split_seurat_cc[["Day0"]]
+DefaultAssay(Day0_cc) <- "RNA"
+
+# Input to CellChat: the log-normalised RNA layer (NOT the integrated assay)
+data.input.Day0 <- LayerData(Day0_cc, assay = "RNA", layer = "data")
+
+# Cluster labels — prefix with "group" to avoid issues with numeric cluster names
+labels <- paste0("group", as.character(Idents(Day0_cc)))
+
+# Metadata MUST have rownames matching colnames of the expression matrix
+# This ordering requirement is critical — mismatches cause silent errors
+metaDay0 <- data.frame(group = as.factor(labels))
+rownames(metaDay0) <- colnames(data.input.Day0)
+
+# Create CellChat object
+cellchatDay0 <- createCellChat(
+  object   = data.input.Day0,
+  meta     = metaDay0,
+  group.by = "group"
+)
+
+# Load and assign the mouse ligand-receptor interaction database
+# For human data: use CellChatDB.human
+CellChatDB         <- CellChatDB.mouse
+cellchatDay0@DB    <- CellChatDB
+
+# ── CORE PIPELINE ─────────────────────────────────────────────────────────────
+# Step 1: Keep only signalling genes present in this dataset
+cellchatDay0 <- subsetData(cellchatDay0)
+
+# Step 2: Find overexpressed genes (above background in at least one group)
+cellchatDay0 <- identifyOverExpressedGenes(cellchatDay0)
+
+# Step 3: Find L-R pairs where BOTH ligand and receptor are overexpressed
+cellchatDay0 <- identifyOverExpressedInteractions(cellchatDay0)
+
+# Step 4: Compute communication probability (mass-action model)
+cellchatDay0 <- computeCommunProb(cellchatDay0)
+
+# Step 5: Filter out interactions from groups with < 10 cells (statistically unreliable)
+cellchatDay0 <- filterCommunication(cellchatDay0, min.cells = 10)
+
+# Step 6: Aggregate L-R pair probabilities to the signalling pathway level
+cellchatDay0 <- computeCommunProbPathway(cellchatDay0)
+
+# Step 7: Build the aggregated communication network (count matrix and weight matrix)
+cellchatDay0 <- aggregateNet(cellchatDay0)
+
+# Visualise as a circle plot: edge width ∝ interaction frequency or strength
+groupSize <- as.numeric(table(cellchatDay0@idents))
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_circle(cellchatDay0@net$count, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Number of Interactions — Day 0")
+netVisual_circle(cellchatDay0@net$weight, vertex.weight = groupSize,
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Interaction Strength — Day 0")
+```
+
+```{r cellchat-day14, eval=FALSE}
+# Identical pipeline for Day14
+Day14_cc <- split_seurat_cc[["Day14"]]
+DefaultAssay(Day14_cc) <- "RNA"
+
+data.input.Day14 <- LayerData(Day14_cc, assay = "RNA", layer = "data")
+labels_14 <- paste0("group", as.character(Idents(Day14_cc)))
+metaDay14 <- data.frame(group = as.factor(labels_14))
+rownames(metaDay14) <- colnames(data.input.Day14)
+metaDay14$samples <- "Day14"  # Suppresses a CellChat warning
+
+cellchatDay14 <- createCellChat(object = data.input.Day14, meta = metaDay14, group.by = "group")
+cellchatDay14@DB <- CellChatDB.mouse
+
+cellchatDay14 <- subsetData(cellchatDay14)
+cellchatDay14 <- identifyOverExpressedGenes(cellchatDay14)
+cellchatDay14 <- identifyOverExpressedInteractions(cellchatDay14)
+cellchatDay14 <- computeCommunProb(cellchatDay14)
+cellchatDay14 <- filterCommunication(cellchatDay14, min.cells = 10)
+cellchatDay14 <- computeCommunProbPathway(cellchatDay14)
+cellchatDay14 <- aggregateNet(cellchatDay14)
+```
+
+## Comparative CellChat analysis
+
+```{r cellchat-compare, eval=FALSE}
+# Compute centrality scores BEFORE merging — required for signalling role plots
+cellchatDay0  <- netAnalysis_computeCentrality(cellchatDay0)
+cellchatDay14 <- netAnalysis_computeCentrality(cellchatDay14)
+
+# Merge into a single comparative object
+object.list <- list(Day0 = cellchatDay0, Day14 = cellchatDay14)
+cellchat    <- mergeCellChat(object.list, add.names = names(object.list))
+
+# 1. Total interactions: has overall communication increased or decreased?
+gg1 <- compareInteractions(cellchat, show.legend = FALSE, group = c(1, 2))
+gg2 <- compareInteractions(cellchat, show.legend = FALSE, group = c(1, 2), measure = "weight")
+gg1 + gg2 + plot_annotation(title = "Total Interactions Day0 vs Day14")
+
+# 2. Differential interactions per cell type (which groups gained/lost communication?)
+par(mfrow = c(1, 2), xpd = TRUE)
+netVisual_diffInteraction(cellchat, weight.scale = TRUE)
+netVisual_diffInteraction(cellchat, weight.scale = TRUE, measure = "weight")
+
+# 3. Heatmap view of sender-receiver interaction matrix
+gg1 <- netVisual_heatmap(cellchat)
+gg2 <- netVisual_heatmap(cellchat, measure = "weight")
+gg1 + gg2
+
+# 4. Signalling role scatter: who are the dominant senders vs. receivers?
+num.link <- sapply(object.list, function(x) {
+  rowSums(x@net$count) + colSums(x@net$count) - diag(x@net$count)
+})
+weight.MinMax <- c(min(num.link), max(num.link))
+gg <- lapply(seq_along(object.list), function(i) {
+  netAnalysis_signalingRole_scatter(object.list[[i]],
+                                    title = names(object.list)[i],
+                                    weight.MinMax = weight.MinMax)
+})
+patchwork::wrap_plots(plots = gg)
+
+# 5. Information flow comparison: which pathways carry the most communication weight?
+# Stacked = TRUE shows absolute flow; stacked = FALSE shows change between conditions
+gg1 <- rankNet(cellchat, mode = "comparison", measure = "weight",
+               stacked = TRUE,  do.stat = TRUE)
+gg2 <- rankNet(cellchat, mode = "comparison", measure = "weight",
+               stacked = FALSE, do.stat = TRUE)
+gg1 + gg2 + plot_annotation(title = "Signalling Pathway Information Flow")
+
+# 6. Outgoing signalling patterns per cell type (who sends which pathways?)
+library(ComplexHeatmap)
+pathway.union <- union(object.list[[1]]@netP$pathways, object.list[[2]]@netP$pathways)
+ht1 <- netAnalysis_signalingRole_heatmap(object.list[[1]], pattern = "outgoing",
+                                          signaling = pathway.union,
+                                          title = "Day0", width = 5, height = 6)
+ht2 <- netAnalysis_signalingRole_heatmap(object.list[[2]], pattern = "outgoing",
+                                          signaling = pathway.union,
+                                          title = "Day14", width = 5, height = 6)
+draw(ht1 + ht2, ht_gap = unit(1, "cm"))
+
+# 7. Bubble plot: specific L-R pairs between chosen sender (4) and receivers (5:11)
+netVisual_bubble(cellchat, sources.use = 4, targets.use = c(5:11),
+                 comparison = c(1, 2), angle.x = 45)
+```
+
+---
+
+# Session Information
+
+```{r session-info}
+# Always record your environment — this is essential for reproducibility.
+# Anyone who wants to replicate your analysis needs to know which package
+# versions were used, as Seurat and CellChat APIs change between versions.
+
+sessionInfo()
+```
+
+---
+
+# What to Do Next
+
+With the results from this notebook, you have:
+
+- An annotated UMAP of all major immune populations in bone marrow at Day 0 and Day 14
+- A T-cell subtype map at single-cell resolution
+- A pseudotime trajectory through T-cell developmental states
+- A comparative cell–cell communication atlas between time points
+
+**Validation steps:**
+- Cross-reference top cluster markers against published databases (CellMarker 2.0, PanglaoDB)
+- Use SingleR or Azimuth for automated annotation as a second opinion
+- Validate one or two key L-R interactions from CellChat with co-culture experiments or spatial transcriptomics
+
+**Extensions:**
+- RNA velocity (scVelo) — adds directionality to the trajectory
+- SCENIC — infers transcription factor activity per cluster
+- CITE-seq — integrates surface protein data with transcriptomics
+- Spatial transcriptomics — localises your clusters within tissue architecture

@@ -1,0 +1,1217 @@
+# ==============================================================================#
+#                            LOAD REQUIRED LIBRARIES                            #
+# ==============================================================================#
+
+# Load libraries required for single-cell RNA-seq analysis,
+# visualization, matrix handling, and data manipulation
+library(SingleCellExperiment)
+library(Seurat)
+library(tidyverse)
+library(Matrix)
+library(scales)
+library(cowplot)
+library(RCurl)
+
+# ==============================================================================#
+#                           READ AND QC DAY 0 SAMPLE                            #
+# ==============================================================================#
+
+# Set working directory to the Day0 sample folder
+setwd("/Volumes/BCP-ALL/presentations/single cell/GSE142564_RAW/Day0")
+
+# List all files in the directory to confirm data presence
+list.files()
+
+# Read 10X Genomics matrix files
+data <- Read10X("/Volumes/BCP-ALL/presentations/single cell/GSE142564_RAW/Day0/")
+
+# Create Seurat object from raw count matrix
+Day0 <- CreateSeuratObject(counts = data)
+
+# Open metadata viewer
+View(Day0)
+
+# Print Seurat object summary
+Day0
+
+# Filter cells with fewer than 200 detected genes
+Day0 <- subset(Day0, subset = nFeature_RNA >= 200)
+
+# Display filtered object summary
+Day0
+
+# ==============================================================================#
+#                                QUALITY CONTROL                                #
+# ==============================================================================#
+
+# Calculate percentage of mitochondrial transcripts per cell
+Day0$mitoRatio <- PercentageFeatureSet(object = Day0, pattern = "^mt-")
+
+# Convert mitochondrial percentage into fraction
+Day0$mitoRatio <- Day0@meta.data$mitoRatio / 100
+
+# Check mitochondrial genes detected in dataset
+grep("^mt-", rownames(Day0))
+
+# Calculate gene complexity score:
+# ratio between detected genes and total UMIs
+Day0$log10GenesPerUMI <- log10(Day0$nFeature_RNA) / log10(Day0$nCount_RNA)
+
+# ==============================================================================#
+#                           INITIAL QC VISUALIZATION                            #
+# ==============================================================================#
+
+# Visualize QC metrics before filtering
+VlnPlot(
+  Day0,
+  features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"),
+  ncol = 3,
+  layer = "counts"
+)
+
+# Remove low-quality cells and potential doublets
+Day0 = subset(
+  Day0,
+  nFeature_RNA < 4000 &
+    nCount_RNA < 20000 &
+    mitoRatio < .05
+)
+
+# Re-visualize QC metrics after filtering
+VlnPlot(
+  Day0,
+  features = c("nFeature_RNA", "nCount_RNA", "mitoRatio"),
+  ncol = 3,
+  layer = "counts"
+)
+
+# ==============================================================================#
+#                              ORGANIZE METADATA                                #
+# ==============================================================================#
+
+# Add sample identity
+Day0$sample = "Day0"
+
+# Extract metadata dataframe
+metadata <- Day0@meta.data
+
+# Store cell barcodes in metadata
+metadata$cells <- rownames(metadata)
+
+# Preserve original counts and feature numbers
+metadata$orig_counts = metadata$nCount_RNA
+metadata$orig_features = metadata$nFeature_RNA
+
+# Rename metadata columns into cleaner names
+metadata <- metadata %>%
+  dplyr::rename(
+    sample = sample,
+    nUMI = nCount_RNA,
+    nGene = nFeature_RNA
+  )
+
+# Add updated metadata back into Seurat object
+Day0@meta.data <- metadata
+
+# ==============================================================================#
+#                         NUMBER OF CELLS PER SAMPLE                            #
+# ==============================================================================#
+
+# Plot total number of cells per sample
+metadata %>%
+  ggplot(aes(x = sample, fill = sample)) +
+  geom_bar(width = 0.7, color = "black", show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set1") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1,
+                               color = "black", face = "bold"),
+    axis.text.y = element_text(color = "black"),
+    axis.title.y = element_text(face = "bold"),
+    plot.title = element_text(face = "bold",
+                              size = 16,
+                              hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Number of Cells per Sample",
+    x = "",
+    y = "Cell Count"
+  )
+
+# ==============================================================================#
+#                           SEQUENCING DEPTH QC                                 #
+# ==============================================================================#
+
+# Plot transcript count distribution per cell
+metadata %>%
+  ggplot(aes(x = nUMI, color = sample, fill = sample)) +
+  geom_density(alpha = 0.3, size = 1) +
+  scale_x_log10() +
+  
+  # Suggested lower cutoff for UMIs
+  geom_vline(
+    xintercept = 2000,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 1
+  ) +
+  
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "top",
+    axis.text = element_text(color = "black"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold",
+                              hjust = 0.5,
+                              size = 16)
+  ) +
+  labs(
+    title = "Transcript Counts per Cell",
+    x = "nUMI",
+    y = "Cell Density"
+  )
+
+# ==============================================================================#
+#                         NUMBER OF GENES PER CELL                              #
+# ==============================================================================#
+
+# Plot detected gene distribution per cell
+metadata %>%
+  ggplot(aes(x = nGene, color = sample, fill = sample)) +
+  geom_density(alpha = 0.3, size = 1) +
+  scale_x_log10() +
+  
+  # Suggested lower cutoff for genes
+  geom_vline(
+    xintercept = 1000,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 1
+  ) +
+  
+  scale_color_brewer(palette = "Set1") +
+  scale_fill_brewer(palette = "Set1") +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.title = element_blank(),
+    legend.position = "top",
+    axis.text = element_text(color = "black"),
+    axis.title.y = element_text(face = "bold"),
+    axis.title.x = element_text(face = "bold"),
+    plot.title = element_text(face = "bold",
+                              hjust = 0.5,
+                              size = 16),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    title = "Gene Counts per Cell",
+    x = "nGene (log10 scale)",
+    y = "Cell Density"
+  )
+
+# ==============================================================================#
+#                      MITOCHONDRIAL CONTENT DISTRIBUTION                       #
+# ==============================================================================#
+
+# Plot mitochondrial transcript ratio distribution
+metadata %>%
+  ggplot(aes(x = mitoRatio, color = sample, fill = sample)) +
+  geom_density(alpha = 0.3, size = 1) +
+  scale_x_log10() +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "top",
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(hjust = 0.5,
+                              face = "bold",
+                              size = 16)
+  ) +
+  labs(
+    title = "Distribution of Mitochondrial Ratio per Sample",
+    x = "Mitochondrial Ratio",
+    y = "Cell Density"
+  )
+
+# ==============================================================================#
+#                    RELATIONSHIP BETWEEN QC METRICS                            #
+# ==============================================================================#
+
+# Scatter plot showing UMI counts vs gene counts,
+# colored by mitochondrial ratio
+metadata %>%
+  ggplot(aes(x = nUMI, y = nGene, color = mitoRatio)) +
+  
+  geom_point(alpha = 0.6, size = 1.5) +
+  
+  # Add regression trend line
+  stat_smooth(
+    method = "lm",
+    color = "blue",
+    se = TRUE,
+    linetype = "dashed"
+  ) +
+  
+  scale_color_gradient(low = "gray90", high = "black") +
+  
+  scale_x_log10() +
+  scale_y_log10() +
+  
+  # Suggested QC thresholds
+  geom_vline(
+    xintercept = 3200,
+    linetype = "dotted",
+    color = "red",
+    linewidth = 0.8
+  ) +
+  
+  geom_hline(
+    yintercept = 1000,
+    linetype = "dotted",
+    color = "red",
+    linewidth = 0.8
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  
+  theme(
+    legend.position = "right",
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold"),
+    strip.text = element_text(face = "bold", size = 12)
+  ) +
+  
+  labs(
+    title = "UMI vs Gene Counts Colored by Mitochondrial Ratio",
+    x = "nUMI",
+    y = "nGene",
+    color = "Mito Ratio"
+  ) +
+  
+  facet_wrap(~sample)
+
+# ==============================================================================#
+#                       GENES PER UMI COMPLEXITY SCORE                          #
+# ==============================================================================#
+
+# Plot transcript complexity distribution
+metadata %>%
+  ggplot(aes(x = log10GenesPerUMI,
+             color = sample,
+             fill = sample)) +
+  
+  geom_density(alpha = 0.3, size = 1) +
+  
+  # Suggested complexity threshold
+  geom_vline(
+    xintercept = 0.82,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 1
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  
+  theme(
+    legend.position = "top",
+    axis.text = element_text(color = "black"),
+    axis.title = element_text(face = "bold"),
+    plot.title = element_text(
+      hjust = 0.5,
+      face = "bold",
+      size = 16
+    )
+  ) +
+  
+  labs(
+    title = "Distribution of Genes per UMI by Sample",
+    x = "Genes per UMI",
+    y = "Cell Density"
+  )
+
+# Apply final QC filtering based on complexity,
+# gene counts, and UMI counts
+Day0 <- subset(
+  x = Day0,
+  subset = (
+    log10GenesPerUMI > 0.82
+  ) &
+    (nGene > 900) &
+    (nUMI > 3200)
+)
+
+# Display dimensions after filtering
+dim(Day0)
+
+# Final QC violin plot
+VlnPlot(
+  Day0,
+  features = c("nGene", "nUMI", "mitoRatio")
+)
+
+# ==============================================================================#
+#                           REPEAT QC FOR DAY14 SAMPLE                          #
+# ==============================================================================#
+
+# Repeat same workflow for Day14 sample
+# Includes:
+# 1. Data loading
+# 2. Seurat object creation
+# 3. QC metric calculation
+# 4. Filtering
+# 5. Metadata organization
+# 6. QC visualization
+
+# ==============================================================================#
+#                              MERGE DATASETS                                   #
+# ==============================================================================#
+
+# Add unique prefixes to cell barcodes
+Day0 <- RenameCells(Day0, add.cell.id = "Day0")
+Day14 <- RenameCells(Day14, add.cell.id = "Day14")
+
+# Merge both Seurat objects
+merged <- merge(x = Day0, y = c(Day14))
+
+# ==============================================================================#
+#                    REMOVE BCR/TCR GENES BEFORE ANALYSIS                       #
+# ==============================================================================#
+
+# Remove immunoglobulin variable genes
+merged <- merged[
+  !grepl("^Ig[hkl]v", rownames(merged), ignore.case = FALSE),
+]
+
+# Remove immunoglobulin joining genes
+merged <- merged[
+  !grepl("^Ig[hkl]j", rownames(merged), ignore.case = FALSE),
+]
+
+# Remove immunoglobulin constant genes
+merged <- merged[
+  !grepl("^Ig[kl]c", rownames(merged), ignore.case = FALSE),
+]
+
+# Remove heavy-chain isotype genes
+merged <- merged[
+  !grepl("^Igh[adegm]", rownames(merged), ignore.case = FALSE),
+]
+
+# Remove T-cell receptor genes
+merged <- merged[
+  !grepl("^Tr[abdg][vjc]", rownames(merged), ignore.case = FALSE),
+]
+
+# ==============================================================================#
+#                           FILTER LOWLY EXPRESSED GENES                        #
+# ==============================================================================#
+
+# Merge assay layers
+merged[["RNA"]] <- JoinLayers(merged[["RNA"]])
+
+# Extract count matrix
+counts <- LayerData(merged, assay = "RNA", layer = "counts")
+
+# Create logical matrix for expressed genes
+nonzero <- counts > 0
+
+# Keep genes expressed in at least 10 cells
+keep_genes <- Matrix::rowSums(nonzero) >= 10
+
+# Subset count matrix
+dual_counts <- counts[keep_genes, ]
+
+# Rebuild Seurat object with filtered genes
+merged <- CreateSeuratObject(
+  dual_counts,
+  meta.data = merged@meta.data
+)
+
+# ==============================================================================#
+#                              CELL CYCLE SCORING                               #
+# ==============================================================================#
+
+# Normalize RNA counts
+merged <- NormalizeData(merged)
+
+# Convert cell-cycle genes to title case
+s.genes <- str_to_title(cc.genes$s.genes)
+g2m.genes <- str_to_title(cc.genes$g2m.genes)
+
+# Perform cell-cycle scoring
+merged <- CellCycleScoring(
+  merged,
+  g2m.features = g2m.genes,
+  s.features = s.genes,
+  set.ident = TRUE
+)
+
+# Visualize cell-cycle marker expression
+RidgePlot(
+  merged,
+  features = c("Pcna", "Top2a", "Mcm6", "Mki67"),
+  ncol = 2
+)
+
+# ==============================================================================#
+#                      VARIABLE FEATURES, SCALING, PCA                          #
+# ==============================================================================#
+
+# Identify highly variable genes
+merged <- FindVariableFeatures(
+  merged,
+  selection.method = "vst",
+  nfeatures = 2000,
+  verbose = FALSE
+)
+
+# Scale expression matrix
+merged <- ScaleData(merged)
+
+# Run principal component analysis
+merged <- RunPCA(merged)
+
+# Visualize PCA colored by cell-cycle phase
+DimPlot(
+  merged,
+  reduction = "pca",
+  group.by = "Phase",
+  split.by = "Phase"
+)
+
+# ==============================================================================#
+#                           SCT NORMALIZATION PIPELINE                          #
+# ==============================================================================#
+
+# Split object by sample before integration
+split_seurat <- SplitObject(merged, split.by = "sample")
+
+# Increase memory allowance for parallel processing
+options(future.globals.maxSize = 8 * 1024^3)
+
+# Perform SCTransform normalization independently per sample
+for (i in 1:length(split_seurat)) {
+  
+  split_seurat[[i]] <- SCTransform(
+    split_seurat[[i]],
+    vars.to.regress = c("S.Score", "G2M.Score")
+  )
+}
+
+# ==============================================================================#
+#                              DATA INTEGRATION                                 #
+# ==============================================================================#
+
+# Select integration features
+bm.features <- SelectIntegrationFeatures(
+  object.list = split_seurat,
+  nfeatures = 3000
+)
+
+# Prepare SCT objects for integration
+bm.list <- PrepSCTIntegration(
+  object.list = split_seurat,
+  anchor.features = bm.features
+)
+
+# Find integration anchors
+bm.anchors <- FindIntegrationAnchors(
+  object.list = bm.list,
+  normalization.method = "SCT",
+  anchor.features = bm.features
+)
+
+# Remove unused objects to free memory
+remove(list = setdiff(ls(), "bm.anchors"))
+
+# Integrate all datasets
+bm.integrated <- IntegrateData(
+  anchorset = bm.anchors,
+  normalization.method = "SCT"
+)
+
+# Set integrated assay as default
+DefaultAssay(bm.integrated) = "integrated"
+
+# ==============================================================================#
+#                        DIMENSIONALITY REDUCTION                               #
+# ==============================================================================#
+
+# Run PCA on integrated data
+bm.integrated <- RunPCA(
+  object = bm.integrated,
+  verbose = FALSE
+)
+
+# Evaluate clustering using different resolutions
+for(i in c(20)) {
+  
+  # Visualize variance explained by PCs
+  ElbowPlot(bm.integrated, ndims = 50)
+  
+  # Run UMAP embedding
+  bm.integrated <- RunUMAP(
+    object = bm.integrated,
+    dims = 1:i,
+    verbose = FALSE
+  )
+  
+  # Build nearest-neighbor graph
+  bm.integrated <- FindNeighbors(
+    bm.integrated,
+    reduction = "pca",
+    dims = 1:i,
+    verbose = FALSE
+  )
+  
+  # Perform clustering across multiple resolutions
+  bm.integrated <- FindClusters(
+    bm.integrated,
+    resolution = c(seq(from = 0.1, to = 2.0, by = 0.1)),
+    verbose = FALSE
+  )
+  
+  # Visualize cluster stability
+  print(
+    clustree(
+      x = bm.integrated,
+      prefix = "integrated_snn_res."
+    ) +
+      ggtitle(paste("clustree", i ,"PCs"))
+  )
+}
+
+# Set chosen clustering resolution
+Idents(bm.integrated) = "integrated_snn_res.0.1"
+
+# Plot integrated UMAP
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  label = TRUE
+) + NoLegend()
+
+# Plot UMAP split by sample
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  split.by = "sample",
+  label = TRUE
+)
+
+# Plot UMAP split by cell-cycle phase
+DimPlot(
+  bm.integrated,
+  reduction = "umap",
+  split.by = "Phase",
+  label = TRUE
+)
+
+# ==============================================================================#
+#                        RNA ASSAY NORMALIZATION                                #
+# ==============================================================================#
+
+# Switch back to RNA assay
+DefaultAssay(bm.integrated) = "RNA"
+
+# Normalize RNA assay
+bm.integrated <- NormalizeData(
+  object = bm.integrated,
+  scale.factor = 10000,
+  normalization.method = "LogNormalize"
+)
+
+# Scale RNA expression matrix
+bm.integrated <- ScaleData(
+  object = bm.integrated,
+  features = rownames(bm.integrated)
+)
+
+# Visualize canonical lineage markers
+FeaturePlot(
+  bm.integrated,
+  features = c("Cd3e", "Cd19", "Adgre1", "Cd14"),
+  label = TRUE,
+  ncol = 2,
+  order = TRUE
+)
+
+# DotPlot of lineage markers
+DotPlot(
+  bm.integrated,
+  features = c("Cd3e", "Cd19", "Adgre1", "Cd14")
+)
+
+# Join assay layers
+bm.integrated = JoinLayers(bm.integrated)
+
+# ==============================================================================#
+#                         DIFFERENTIAL EXPRESSION                               #
+# ==============================================================================#
+
+# Identify positive cluster markers
+markers <- FindAllMarkers(
+  object = bm.integrated,
+  logfc.threshold = 0.25,
+  test.use = "negbinom",
+  only.pos = TRUE,
+  return.thresh = 0.05
+)
+
+# Keep significant markers only
+markers <- markers %>%
+  filter(p_val_adj > 0 & p_val_adj < 0.05)
+
+# ==============================================================================#
+#                          TOP MARKERS HEATMAP                                  #
+# ==============================================================================#
+
+# Select top 10 markers per cluster
+markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  slice_head(n = 10) %>%
+  ungroup() -> top10
+
+# Store integrated object
+seurat_integrated = bm.integrated
+
+# Heatmap visualization
+DoHeatmap(
+  seurat_integrated,
+  features = top10$gene
+) + NoLegend()
+
+# DotPlot visualization of top markers
+DotPlot(
+  seurat_integrated,
+  features = top10$gene
+)
+
+# ==============================================================================#
+#                             T-CELL SUBCLUSTERING                              #
+# ==============================================================================#
+
+# Subset T-cell cluster
+T_cell = subset(
+  seurat_integrated,
+  subset = integrated_snn_res.0.1 == "3"
+)
+
+# Use integrated assay
+DefaultAssay(T_cell) = "integrated"
+
+# Run UMAP on T-cell subset
+T_cell <- RunUMAP(
+  object = T_cell,
+  dims = 1:20,
+  verbose = FALSE
+)
+
+# Compute nearest neighbors
+T_cell <- FindNeighbors(
+  T_cell,
+  reduction = "pca",
+  dims = 1:i,
+  verbose = FALSE
+)
+
+# Perform subclustering
+T_cell <- FindClusters(
+  T_cell,
+  resolution = c(seq(from = 0.1, to = 2.0, by = 0.1)),
+  verbose = FALSE
+)
+
+# Visualize clustering tree
+print(
+  clustree(
+    x = T_cell,
+    prefix = "integrated_snn_res."
+  )
+)
+
+# Set selected clustering resolution
+Idents(T_cell) = "integrated_snn_res.0.2"
+
+# Plot T-cell UMAP
+DimPlot(T_cell, label = TRUE)
+
+# ==============================================================================#
+#                         T-CELL MARKER VISUALIZATION                           #
+# ==============================================================================#
+
+# Switch to RNA assay
+DefaultAssay(T_cell) = "RNA"
+
+# Normalize RNA assay
+T_cell <- NormalizeData(
+  object = T_cell,
+  scale.factor = 10000,
+  normalization.method = "LogNormalize"
+)
+
+# Scale RNA data
+T_cell <- ScaleData(
+  object = T_cell,
+  features = rownames(T_cell)
+)
+
+# Define marker genes for T-cell subsets
+tcell_clusters <- list(
+  
+  Cytotoxic_T_cells = c(
+    "Lef1", "Ms4a4b", "Cd8a"
+  ),
+  
+  Th17_cells = c(
+    "Tnfsf8", "Cxcr6", "Cd4", "Il17a", "Rora"
+  ),
+  
+  Regulatory_T_cells = c(
+    "Foxp3", "Ctla4"
+  ),
+  
+  Il17a_positive_gdT_cells = c(
+    "Il23r", "Trgv2"
+  ),
+  
+  Il17a_negative_gdT_cells = c(
+    "Birc5", "Top2a"
+  )
+)
+
+# Visualize marker expression across clusters
+DotPlot(T_cell, features = tcell_clusters)
+
+# Plot selected genes on UMAP
+FeaturePlot(
+  T_cell,
+  features = c(
+    "Cr2", "Mme", "Cd9", "Plpp5",
+    "Tcl1a", "Il4", "Bach2",
+    "Cd27", "Prdm1"
+  ),
+  label = TRUE
+)
+
+# Join assay layers
+T_cell = JoinLayers(T_cell)
+
+# ==============================================================================#
+#                        DIFFERENTIAL EXPRESSION IN T CELLS                     #
+# ==============================================================================#
+
+# Identify T-cell cluster markers
+markers <- FindAllMarkers(
+  object = T_cell,
+  logfc.threshold = 0.25,
+  test.use = "negbinom",
+  only.pos = TRUE,
+  return.thresh = 0.05
+)
+
+# Keep significant markers
+markers <- markers %>%
+  filter(p_val_adj > 0 & p_val_adj < 0.05)
+
+# ==============================================================================#
+#                         TRAJECTORY ANALYSIS WITH MONOCLE3                     #
+# ==============================================================================#
+
+# Load trajectory analysis packages
+library(monocle3)
+library(SeuratWrappers)
+
+# Use integrated assay
+DefaultAssay(T_cell) = "integrated"
+
+# Convert Seurat object into Monocle3 cell_data_set object
+bm.integrated.cds <- as.cell_data_set(
+  T_cell,
+  group.by = "integrated_snn_res.0.2"
+)
+
+# Re-cluster cells inside Monocle3
+bm.integrated.cds <- cluster_cells(
+  cds = bm.integrated.cds,
+  reduction_method = "UMAP"
+)
+
+# Learn developmental trajectory graph
+bm.integrated.cds <- learn_graph(
+  bm.integrated.cds,
+  use_partition = TRUE
+)
+
+# Visualize trajectory graph
+plot_cells(
+  cds = bm.integrated.cds,
+  show_trajectory_graph = TRUE
+)
+
+# Order cells in pseudotime
+bm.integrated.cds <- order_cells(
+  bm.integrated.cds,
+  reduction_method = "UMAP"
+)
+
+# Plot pseudotime trajectory
+plot_cells(
+  cds = bm.integrated.cds,
+  color_cells_by = "pseudotime",
+  show_trajectory_graph = TRUE
+)
+
+# ==============================================================================#
+#                                 END OF ANALYSIS                               #
+# ==============================================================================#
+
+# ==============================================================================#
+#                          LOAD REQUIRED LIBRARIES                              #
+# ==============================================================================#
+
+# Load packages required for CellChat analysis and visualization
+library(Seurat)
+library(CellChat)
+library(patchwork)
+
+# Prevent automatic conversion of character variables into factors
+options(stringsAsFactors = FALSE)
+
+# ==============================================================================#
+#                        SPLIT SEURAT OBJECT BY SAMPLE                          #
+# ==============================================================================#
+
+# Split integrated Seurat object based on sample identity
+split_seurat <- SplitObject(bm.integrated, split.by = "sample")
+
+# Keep only the selected samples
+split_seurat <- split_seurat[c("Day0", "Day14")]
+
+# ==============================================================================#
+#                            CELLCHAT ANALYSIS: DAY0                            #
+# ==============================================================================#
+
+# Extract Day0 object
+Day0 <- split_seurat[["Day0"]]
+
+# Extract expression matrix
+data.input.Day0 <- LayerData(
+  Day0,
+  assay = "RNA",
+  layer = "data"
+)
+
+# Extract cluster identities
+labels <- Idents(Day0)
+
+# Add prefix "group"
+labels <- paste0("group", as.character(labels))
+
+# IMPORTANT: force exact matching order with expression matrix
+metaDay0 <- data.frame(
+  group = labels
+)
+
+rownames(metaDay0) <- colnames(data.input.Day0)
+
+# Convert to factor
+metaDay0$group <- as.factor(metaDay0$group)
+
+# Create CellChat object
+cellchatDay0 <- createCellChat(
+  object = data.input.Day0,
+  meta = metaDay0,
+  group.by = "group"
+)
+
+# Preview metadata
+head(metaDay0)
+
+# Load mouse CellChat database
+CellChatDB <- CellChatDB.mouse
+
+# Inspect ligand-receptor interaction database
+dplyr::glimpse(CellChatDB$interaction)
+
+# Assign database to CellChat object
+CellChatDB.use <- CellChatDB
+cellchatDay0@DB <- CellChatDB.use
+
+# Keep signaling genes present in dataset
+cellchatDay0 <- subsetData(cellchatDay0)
+
+# Identify overexpressed genes
+cellchatDay0 <- identifyOverExpressedGenes(cellchatDay0)
+
+# Identify overexpressed ligand-receptor interactions
+cellchatDay0 <- identifyOverExpressedInteractions(cellchatDay0)
+
+
+# Compute communication probabilities
+cellchatDay0 <- computeCommunProb(cellchatDay0)
+
+# Filter weak interactions
+cellchatDay0 <- filterCommunication(
+  cellchatDay0,
+  min.cells = 10
+)
+
+# Compute pathway-level communication probabilities
+cellchatDay0 <- computeCommunProbPathway(cellchatDay0)
+
+# Aggregate communication network
+cellchatDay0 <- aggregateNet(cellchatDay0)
+
+# Calculate cluster sizes
+groupSize <- as.numeric(table(cellchatDay0@idents))
+
+# Plot interaction number and interaction strength
+par(mfrow = c(1,2), xpd = TRUE)
+
+# Plot number of interactions
+netVisual_circle(
+  cellchatDay0@net$count,
+  vertex.weight = groupSize,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Number of interactions in Day0"
+)
+
+# Plot interaction strength
+netVisual_circle(
+  cellchatDay0@net$weight,
+  vertex.weight = groupSize,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Interaction weights/strength"
+)
+
+# ==============================================================================#
+#                           CELLCHAT ANALYSIS: DAY14                            #
+# ==============================================================================#
+# Extract Day14 object
+Day14 <- split_seurat[["Day14"]]
+
+# Set RNA assay as default
+DefaultAssay(Day14) <- "RNA"
+
+# Extract normalized expression matrix
+data.input.Day14 <- LayerData(
+  Day14,
+  assay = "RNA",
+  layer = "data"
+)
+
+# Extract cluster identities
+labels <- Idents(Day14)
+
+# Add prefix to avoid issues with numeric clusters
+labels <- paste0("group", as.character(labels))
+
+# Create metadata dataframe (IMPORTANT: must match expression matrix order)
+metaDay14 <- data.frame(group = as.factor(labels))
+rownames(metaDay14) <- colnames(data.input.Day14)
+
+# Optional but recommended (removes CellChat warning)
+metaDay14$samples <- "Day14"
+
+# Preview metadata
+head(metaDay14)
+
+# Create CellChat object
+cellchatDay14 <- createCellChat(
+  object = data.input.Day14,
+  meta = metaDay14,
+  group.by = "group"
+)
+
+# Load CellChat mouse database
+CellChatDB <- CellChatDB.mouse
+
+# Inspect database structure
+dplyr::glimpse(CellChatDB$interaction)
+
+# Assign database
+cellchatDay14@DB <- CellChatDB
+
+# Keep signaling genes
+cellchatDay14 <- subsetData(cellchatDay14)
+
+# Identify overexpressed genes
+cellchatDay14 <- identifyOverExpressedGenes(cellchatDay14)
+
+# Identify ligand-receptor interactions
+cellchatDay14 <- identifyOverExpressedInteractions(cellchatDay14)
+
+
+# Compute communication probability
+cellchatDay14 <- computeCommunProb(cellchatDay14)
+
+# Filter weak interactions
+cellchatDay14 <- filterCommunication(cellchatDay14, min.cells = 10)
+
+# Compute pathway-level communication
+cellchatDay14 <- computeCommunProbPathway(cellchatDay14)
+
+# Aggregate network
+cellchatDay14 <- aggregateNet(cellchatDay14)
+
+# ==============================================================================#
+#                           VISUALIZATION                                       #
+# ==============================================================================#
+
+# Compute cluster sizes
+groupSize <- as.numeric(table(cellchatDay14@idents))
+
+# Plot side-by-side networks
+par(mfrow = c(1, 2), xpd = TRUE)
+
+# Number of interactions
+netVisual_circle(
+  cellchatDay14@net$count,
+  vertex.weight = groupSize,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Number of interactions in Day14"
+)
+
+# Interaction strength
+netVisual_circle(
+  cellchatDay14@net$weight,
+  vertex.weight = groupSize,
+  weight.scale = TRUE,
+  label.edge = FALSE,
+  title.name = "Interaction weights/strength"
+)
+
+
+
+
+
+# ==============================================================================#
+# 1. MERGE CELLCHAT OBJECTS (CORE COMPARISON STEP)
+# ==============================================================================#
+cellchatDay0 = netAnalysis_computeCentrality(cellchatDay0)
+cellchatDay14 = netAnalysis_computeCentrality(cellchatDay14)
+
+object.list <- list(
+  Day0 = cellchatDay0,
+  Day14 = cellchatDay14
+)
+
+cellchat <- mergeCellChat(object.list, add.names = names(object.list))
+
+# ==============================================================================#
+# 2. Compare the total number of interactions and interaction strength
+# ==============================================================================#
+ptm = Sys.time()
+gg1 <- compareInteractions(cellchat, show.legend = F, group = c(1,2))
+gg2 <- compareInteractions(cellchat, show.legend = F, group = c(1,2), measure = "weight")
+gg1 + gg2
+
+
+
+# ==============================================================================#
+# differential number of interactions or interaction strength among different cell populations across two datasets
+# ==============================================================================#
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_diffInteraction(cellchat, weight.scale = T)
+netVisual_diffInteraction(cellchat, weight.scale = T, measure = "weight")
+
+
+# ==============================================================================#
+# differential number of interactions or interaction strength among different cell populations across two datasets
+# ==============================================================================#
+gg1 <- netVisual_heatmap(cellchat)
+#> Do heatmap based on a merged object
+gg2 <- netVisual_heatmap(cellchat, measure = "weight")
+#> Do heatmap based on a merged object
+gg1 + gg2
+
+# ==============================================================================#
+#Identify cell populations with significant changes in sending or receiving signals
+# ==============================================================================#
+
+
+num.link <- sapply(object.list, function(x) {rowSums(x@net$count) + colSums(x@net$count)-diag(x@net$count)})
+weight.MinMax <- c(min(num.link), max(num.link)) # control the dot size in the different datasets
+gg <- list()
+for (i in 1:length(object.list)) {
+  gg[[i]] <- netAnalysis_signalingRole_scatter(object.list[[i]], title = names(object.list)[i], weight.MinMax = weight.MinMax)
+}
+#> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+#> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+patchwork::wrap_plots(plots = gg)
+
+
+
+
+
+
+# ==============================================================================#
+# Identify signaling groups based on their functional similarity
+# ==============================================================================#
+ptm = Sys.time()
+
+cellchat <- computeNetSimilarityPairwise(cellchat, type = "functional")
+cellchat <- netEmbedding(cellchat, type = "functional", umap.method = "uwot")
+cellchat <- netClustering(cellchat, type = "functional")
+netVisual_embeddingPairwise(cellchat, type = "functional", label.size = 3.5)
+
+
+# ==============================================================================#
+# Identify signaling groups based on structure similarity
+# ==============================================================================#
+cellchat <- computeNetSimilarityPairwise(cellchat, type = "structural")
+cellchat <- netEmbedding(cellchat, type = "structural", umap.method = "uwot")
+cellchat <- netClustering(cellchat, type = "structural")
+# Visualization in 2D-space
+netVisual_embeddingPairwise(cellchat, type = "structural", label.size = 3.5)
+netVisual_embeddingPairwiseZoomIn(cellchat, type = "structural", nCol = 2)
+
+# ==============================================================================#
+# Compute and visualize the pathway distance in the learned joint manifold
+# ==============================================================================#
+rankSimilarity(cellchat, type = "functional")
+
+# ==============================================================================#
+#CellChat can identify the conserved and context-specific signaling pathways by simply comparing the information flow for each signaling pathway
+# ==============================================================================#
+gg1 <- rankNet(cellchat, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = T, do.stat = TRUE)
+gg2 <- rankNet(cellchat, mode = "comparison", measure = "weight", sources.use = NULL, targets.use = NULL, stacked = F, do.stat = TRUE)
+
+gg1 + gg2
+
+
+# ==============================================================================#
+#Compare outgoing (or incoming) signaling patterns associated with each cell population
+# ==============================================================================#
+library(ComplexHeatmap)
+i = 1
+# combining all the identified signaling pathways from different datasets 
+pathway.union <- union(object.list[[i]]@netP$pathways, object.list[[i+1]]@netP$pathways)
+ht1 = netAnalysis_signalingRole_heatmap(object.list[[i]], pattern = "outgoing", signaling = pathway.union, title = names(object.list)[i], width = 5, height = 6)
+ht2 = netAnalysis_signalingRole_heatmap(object.list[[i+1]], pattern = "outgoing", signaling = pathway.union, title = names(object.list)[i+1], width = 5, height = 6)
+draw(ht1 + ht2, ht_gap = unit(1, "cm"))
+
+
+# ==============================================================================#
+#Identify dysfunctional signaling by comparing the communication probabities
+# ==============================================================================#
+ptm = Sys.time()
+
+netVisual_bubble(cellchat, sources.use = 4, targets.use = c(5:11),  comparison = c(1, 2), angle.x = 45)
+#> Comparing communications on a merged object
+
