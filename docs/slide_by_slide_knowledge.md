@@ -1,7 +1,6 @@
 # Slide-by-Slide Knowledge Extraction
 
-> **Source:** scRNA_seq_Presentation_pptx.pptx  
-> **Author:** Farag Ibrahim, University of Gothenburg, Sweden  
+> **Source:** scRNA_seq_Presentation_pptx.pptx   
 > **Total slides:** 109  
 > Slides with primarily visual/image content are noted where text extraction was limited.
 
