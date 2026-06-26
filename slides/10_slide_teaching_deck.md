@@ -1,7 +1,6 @@
 # 10-Slide Teaching Deck: Single-Cell RNA-seq Analysis
 
-**Course:** Introduction to scRNA-seq: Concepts, Applications, and Analysis  
-**Author:** Based on materials by Farag Ibrahim, University of Gothenburg, Sweden  
+**Course:** Introduction to scRNA-seq: Concepts, Applications, and Analysis    
 **Format:** Markdown teaching deck — each slide includes bullet points, code snippets, and teaching notes
 
 ---
