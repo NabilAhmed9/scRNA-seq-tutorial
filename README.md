@@ -1,6 +1,5 @@
 # scRNA-seq Analysis Tutorial: From Raw Counts to Cell Communication
-
-**Author:** Farag Ibrahim — Research Fellow, Bioinformatician, University of Gothenburg, Sweden  
+ 
 **Dataset:** GSE142564 (Day 0 and Day 14 bone marrow samples, mouse)  
 **Language:** R  
 **Analysis Packages:** Seurat, Monocle3, CellChat  
@@ -135,9 +134,6 @@ After completing this tutorial, learners will be able to:
 
 ---
 
-## Citation / Attribution
 
-If you use or adapt this tutorial, please acknowledge the original author:  
-**Farag Ibrahim**, University of Gothenburg, Sweden.
 
 Dataset: *GEO accession GSE142564*
